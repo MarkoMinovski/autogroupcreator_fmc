@@ -1,0 +1,7 @@
+{
+  "fmc_url": "https://fmcrestapisandbox.cisco.com",
+  "username": "minovski",
+  "password": "",
+  "verify_ssl": false,
+  "ca_cert": ""
+}

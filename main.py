@@ -1,0 +1,560 @@
+import builtins
+import csv
+import json
+import os
+import queue
+import re
+import sys
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+from fmc_api_communicator import fmc_api_communicator
+
+
+DEFAULT_FMC_URL = "https://fmcrestapisandbox.cisco.com"
+DEFAULT_DOMAIN_UUID = "e276abec-e0f2-11e3-8169-6d9ed49b625f"  # replaced by the value FMC returns at login
+
+URL_OBJECT_PREFIX = "AGC-URL_"
+HOST_OBJECT_PREFIX = "AGC-HOST_"
+NETWORK_GROUP_NAME = "AGC-Imported-Hosts"
+URL_GROUP_NAME = "AGC-Imported-URLs"
+
+# Frozen executables (PyInstaller etc.) don't ship the site module, so the
+# exit() builtin used by fmc_api_communicator doesn't exist there. Restore it
+# so the communicator's exit() raises SystemExit, which the GUI handles.
+if not hasattr(builtins, "exit"):
+    builtins.exit = sys.exit
+
+
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = APP_DIR / "fmc_config.json"
+ENV_URL, ENV_USER, ENV_PASS = "FMC_URL", "FMC_USERNAME", "FMC_PASSWORD"
+
+# Colour palette
+C_BG = "#F3F6FA"        # window background
+C_PANEL = "#FFFFFF"     # frames / entries
+C_HEADER = "#0B3C5D"    # deep navy header
+C_ACCENT = "#1D7FC4"    # primary blue
+C_ACCENT_HOVER = "#166299"
+C_ACCENT_DISABLED = "#9DB8CC"
+C_SECONDARY = "#E1E8F0"
+C_SECONDARY_HOVER = "#CFD9E4"
+C_TEXT = "#1E2A38"
+C_MUTED = "#5B6B7C"
+C_LOG_BG = "#0F1B2A"
+C_LOG_TEXT = "#D6E2F0"
+C_LOG_INFO = "#6CB6F2"
+C_LOG_OK = "#4ADE80"
+C_LOG_WARN = "#FBBF24"
+C_LOG_ERR = "#F87171"
+
+
+# ---------------------------------------------------------------------------
+# Config handling
+# ---------------------------------------------------------------------------
+
+def load_config():
+    """Return dict with fmc_url, username, password, verify_ssl, ca_cert.
+    Precedence: environment variables > config file > defaults."""
+    cfg = {
+        "fmc_url": DEFAULT_FMC_URL,
+        "username": "",
+        "password": "",
+        "verify_ssl": False,
+        "ca_cert": "",
+    }
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        for key in cfg:
+            if key in data:
+                cfg[key] = data[key]
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as err:
+        print("Could not read {}: {}".format(CONFIG_PATH, err))
+
+    cfg["fmc_url"] = os.environ.get(ENV_URL, cfg["fmc_url"])
+    cfg["username"] = os.environ.get(ENV_USER, cfg["username"])
+    cfg["password"] = os.environ.get(ENV_PASS, cfg["password"])
+    return cfg
+
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    try:
+        os.chmod(CONFIG_PATH, 0o600)  # owner-only; no-op/ignored on some platforms
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Import logic
+# ---------------------------------------------------------------------------
+
+def build_url_object_name(url_value):
+    return URL_OBJECT_PREFIX + url_value
+
+
+def build_host_object_name(ip):
+    return HOST_OBJECT_PREFIX + ip
+
+
+def to_url_value(fqdn):
+    # Leading "*." becomes a leading "." (FMC suffix match). Other wildcards are
+    # approximated and reported; fully-wildcard entries are unusable.
+    if fqdn.startswith('*.'):
+        return '.' + fqdn[2:], None
+
+    if '*' in fqdn:
+        stripped = fqdn.replace('*', '')
+        stripped = re.sub(r'\.\.+', '.', stripped).strip('.')
+        if not stripped:
+            return None, "unusable"
+        return stripped, "approximated"
+
+    return fqdn, None
+
+
+def get_or_create_url_object(fmc, url_endpoint, url_value, cache):
+    if url_value in cache:
+        return cache[url_value]
+
+    object_name = build_url_object_name(url_value)
+
+    existing = fmc.getObjectByName(url_endpoint, object_name)
+    if existing:
+        cache[url_value] = existing
+        return existing
+
+    created = fmc.createObject(url_endpoint, {
+        "name": object_name,
+        "url": url_value,
+        "type": "Url",
+    })
+    cache[url_value] = created
+    return created
+
+
+def get_or_create_host_object(fmc, host_endpoint, ip, cache):
+    if ip in cache:
+        return cache[ip]
+
+    object_name = build_host_object_name(ip)
+
+    existing = fmc.getObjectByName(host_endpoint, object_name)
+    if existing:
+        cache[ip] = existing
+        return existing
+
+    created = fmc.createObject(host_endpoint, {
+        "name": object_name,
+        "value": ip,
+        "type": "Host",
+    })
+    cache[ip] = created
+    return created
+
+
+def upsert_object(fmc, endpoint, name, object_json):
+    existing = fmc.getObjectByName(endpoint, name)
+
+    if existing:
+        object_json["id"] = existing["id"]
+        return fmc.updateObject(endpoint, existing["id"], object_json)
+
+    return fmc.createObject(endpoint, object_json)
+
+
+def run_import(fmc_ip, username, password, ssl_verify, ssl_cert, csv_path):
+    fmc = fmc_api_communicator(
+        domain_uuid=DEFAULT_DOMAIN_UUID,
+        fmc_user=username,
+        fmc_password=password,
+        ssl_verify=ssl_verify,
+        ssl_cert=ssl_cert,
+        fmc_ip=fmc_ip,
+    )
+
+    base = fmc_ip.rstrip('/')
+    domain_url = "{}/api/fmc_config/v1/domain/{}".format(base, fmc.domain_uuid)
+
+    host_endpoint = domain_url + "/object/hosts"
+    network_group_endpoint = domain_url + "/object/networkgroups"
+    url_endpoint = domain_url + "/object/urls"
+    url_group_endpoint = domain_url + "/object/urlgroups"
+
+    host_cache, url_cache = {}, {}
+    approximated, skipped = [], []
+
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        for line_no, row in enumerate(csv.DictReader(f), start=2):  # line 1 is the header
+            ip = (row.get("ipv4_address") or "").strip()
+            fqdn = (row.get("url") or "").strip()
+
+            if ip:
+                get_or_create_host_object(fmc, host_endpoint, ip, host_cache)
+
+            if fqdn:
+                url_value, note = to_url_value(fqdn)
+                if url_value is None:
+                    skipped.append((line_no, fqdn))
+                    continue
+                if note == "approximated":
+                    approximated.append((line_no, fqdn, url_value))
+                get_or_create_url_object(fmc, url_endpoint, url_value, url_cache)
+
+    if host_cache:
+        upsert_object(fmc, network_group_endpoint, NETWORK_GROUP_NAME, {
+            "name": NETWORK_GROUP_NAME,
+            "type": "NetworkGroup",
+            "objects": [{"type": o["type"], "id": o["id"]} for o in host_cache.values()],
+        })
+
+    if url_cache:
+        upsert_object(fmc, url_group_endpoint, URL_GROUP_NAME, {
+            "name": URL_GROUP_NAME,
+            "type": "UrlGroup",
+            "objects": [{"type": o["type"], "id": o["id"]} for o in url_cache.values()],
+        })
+
+    print("\nDone. {} host objects and {} URL objects processed.".format(len(host_cache), len(url_cache)))
+    for line_no, original, converted in approximated:
+        print("  line {}: '{}' approximated as '{}'".format(line_no, original, converted))
+    for line_no, original in skipped:
+        print("  line {}: '{}' skipped (unusable after wildcard conversion)".format(line_no, original))
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class QueueWriter:
+    """File-like object that sends print() output to a queue for the log box."""
+
+    def __init__(self, q):
+        self.q = q
+
+    def write(self, text):
+        if text:
+            self.q.put(text)
+
+    def flush(self):
+        pass
+
+
+class Tooltip:
+    """Small hover tooltip for any widget."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, _event=None):
+        if self.tip:
+            return
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry("+{}+{}".format(x, y))
+        tk.Label(self.tip, text=self.text, bg=C_HEADER, fg="#FFFFFF", relief="flat",
+                 padx=8, pady=4, font=("Segoe UI", 9)).pack()
+
+    def _hide(self, _event=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("FMC CSV Importer")
+        self.geometry("760x640")
+        self.minsize(640, 540)
+        self.configure(bg=C_BG)
+
+        self.log_queue = queue.Queue()
+        self.worker = None
+
+        cfg = load_config()
+        self.fmc_url_var = tk.StringVar(value=cfg["fmc_url"])
+        self.user_var = tk.StringVar(value=cfg["username"])
+        self.pass_var = tk.StringVar(value=cfg["password"])
+        self.verify_var = tk.BooleanVar(value=bool(cfg["verify_ssl"]))
+        self.cert_var = tk.StringVar(value=cfg["ca_cert"])
+        self.save_pass_var = tk.BooleanVar(value=False)
+        self.csv_var = tk.StringVar()
+
+        self._setup_style()
+        self._build_ui()
+        self._toggle_cert()
+        self.after(100, self._drain_log)
+
+    # -- styling -----------------------------------------------------------
+
+    def _setup_style(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")  # most colour-friendly built-in theme
+
+        style.configure(".", background=C_BG, foreground=C_TEXT, font=("Segoe UI", 10))
+        style.configure("TFrame", background=C_BG)
+        style.configure("TLabel", background=C_PANEL, foreground=C_TEXT)
+        style.configure("Muted.TLabel", background=C_PANEL, foreground=C_MUTED, font=("Segoe UI", 9))
+
+        style.configure("TLabelframe", background=C_PANEL, bordercolor=C_SECONDARY, relief="solid")
+        style.configure("TLabelframe.Label", background=C_PANEL, foreground=C_HEADER,
+                        font=("Segoe UI", 10, "bold"))
+
+        style.configure("TEntry", fieldbackground="#FFFFFF", bordercolor="#B8C4D2",
+                        lightcolor="#B8C4D2", darkcolor="#B8C4D2", padding=4)
+        style.map("TEntry", bordercolor=[("focus", C_ACCENT)], lightcolor=[("focus", C_ACCENT)],
+                  darkcolor=[("focus", C_ACCENT)])
+
+        style.configure("TCheckbutton", background=C_PANEL, foreground=C_TEXT)
+        style.map("TCheckbutton", background=[("active", C_PANEL)])
+
+        style.configure("TButton", background=C_SECONDARY, foreground=C_TEXT, borderwidth=0,
+                        padding=(12, 6), focuscolor=C_SECONDARY)
+        style.map("TButton", background=[("active", C_SECONDARY_HOVER), ("disabled", C_SECONDARY)],
+                  foreground=[("disabled", C_MUTED)])
+
+        style.configure("Accent.TButton", background=C_ACCENT, foreground="#FFFFFF",
+                        font=("Segoe UI", 11, "bold"), padding=(24, 8), focuscolor=C_ACCENT)
+        style.map("Accent.TButton",
+                  background=[("active", C_ACCENT_HOVER), ("disabled", C_ACCENT_DISABLED)],
+                  foreground=[("disabled", "#FFFFFF")])
+
+        style.configure("Vertical.TScrollbar", background=C_SECONDARY, troughcolor=C_LOG_BG,
+                        bordercolor=C_LOG_BG, arrowcolor=C_TEXT)
+
+    def _build_ui(self):
+        pad = {"padx": 8, "pady": 5}
+
+        # Header banner
+        header = tk.Frame(self, bg=C_HEADER)
+        header.pack(fill="x")
+        tk.Label(header, text="FMC CSV Importer", bg=C_HEADER, fg="#FFFFFF",
+                 font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=16, pady=(12, 0))
+        tk.Label(header, text="Create host / URL objects and groups from a CSV", bg=C_HEADER,
+                 fg="#9CC4E4", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(0, 12))
+        tk.Label(header, text="Contact: minovskimarco@gmail.com", bg=C_HEADER,
+                 fg="#9CC4E4", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(0, 12))
+        tk.Frame(self, bg=C_ACCENT, height=3).pack(fill="x")
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=12, pady=10)
+
+        # Connection
+        creds = ttk.LabelFrame(body, text=" FMC connection ")
+        creds.pack(fill="x", pady=(0, 8))
+        creds.columnconfigure(1, weight=1)
+
+        ttk.Label(creds, text="FMC URL:").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(creds, textvariable=self.fmc_url_var).grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+
+        ttk.Label(creds, text="Username:").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Entry(creds, textvariable=self.user_var).grid(row=1, column=1, columnspan=2, sticky="ew", **pad)
+
+        ttk.Label(creds, text="Password:").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Entry(creds, textvariable=self.pass_var, show="*").grid(row=2, column=1, columnspan=2, sticky="ew", **pad)
+
+        ssl_row = tk.Frame(creds, bg=C_PANEL)
+        ssl_row.grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Checkbutton(ssl_row, text="Verify SSL certificate", variable=self.verify_var,
+                        command=self._toggle_cert).pack(side="left")
+        ssl_help = tk.Label(ssl_row, text="(?)", bg=C_PANEL, fg=C_ACCENT, cursor="question_arrow",
+                            font=("Segoe UI", 9, "bold"))
+        ssl_help.pack(side="left", padx=(6, 0))
+        Tooltip(ssl_help, "Untested. Contact me if you encounter any problems")
+
+        ttk.Label(creds, text="CA cert file:").grid(row=4, column=0, sticky="w", **pad)
+        self.cert_entry = ttk.Entry(creds, textvariable=self.cert_var)
+        self.cert_entry.grid(row=4, column=1, sticky="ew", **pad)
+        self.cert_btn = ttk.Button(creds, text="Browse...", command=self._browse_cert)
+        self.cert_btn.grid(row=4, column=2, **pad)
+
+        # Config row
+        cfg_row = ttk.Frame(creds, style="TFrame")
+        cfg_row.grid(row=5, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 8))
+        cfg_row.configure(style="TFrame")
+        ttk.Button(cfg_row, text="Reload config", command=self._reload_config).pack(side="left")
+        ttk.Button(cfg_row, text="Save to config", command=self._save_config).pack(side="left", padx=(6, 10))
+        ttk.Checkbutton(cfg_row, text="Include password (stored as plain text)",
+                        variable=self.save_pass_var).pack(side="left")
+        ttk.Label(creds, text="Config: {}   |   Env overrides: {}, {}, {}".format(
+            CONFIG_PATH.name, ENV_URL, ENV_USER, ENV_PASS), style="Muted.TLabel"
+        ).grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+
+        # CSV
+        csv_frame = ttk.LabelFrame(body, text=" Input CSV (columns: ipv4_address,url) ")
+        csv_frame.pack(fill="x", pady=(0, 8))
+        csv_frame.columnconfigure(0, weight=1)
+        ttk.Entry(csv_frame, textvariable=self.csv_var).grid(row=0, column=0, sticky="ew", **pad)
+        ttk.Button(csv_frame, text="Browse...", command=self._browse_csv).grid(row=0, column=1, **pad)
+
+        # Run
+        self.run_btn = ttk.Button(body, text="Run import", style="Accent.TButton", command=self._start)
+        self.run_btn.pack(pady=4)
+
+        # Log
+        log_frame = ttk.LabelFrame(body, text=" Log ")
+        log_frame.pack(fill="both", expand=True, pady=(4, 0))
+        self.log = tk.Text(log_frame, wrap="word", state="disabled", height=10, bg=C_LOG_BG,
+                           fg=C_LOG_TEXT, insertbackground=C_LOG_TEXT, relief="flat",
+                           font=("Consolas", 9), padx=8, pady=6)
+        scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
+        self.log.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+
+        self.log.tag_configure("info", foreground=C_LOG_INFO)
+        self.log.tag_configure("ok", foreground=C_LOG_OK)
+        self.log.tag_configure("warn", foreground=C_LOG_WARN)
+        self.log.tag_configure("err", foreground=C_LOG_ERR)
+        self.log.tag_configure("banner", foreground="#FFFFFF", font=("Consolas", 9, "bold"))
+
+    # -- config actions ------------------------------------------------------
+
+    def _reload_config(self):
+        cfg = load_config()
+        self.fmc_url_var.set(cfg["fmc_url"])
+        self.user_var.set(cfg["username"])
+        self.pass_var.set(cfg["password"])
+        self.verify_var.set(bool(cfg["verify_ssl"]))
+        self.cert_var.set(cfg["ca_cert"])
+        self._toggle_cert()
+        self._append_log("Config reloaded from {} (and environment).\n".format(CONFIG_PATH.name), "info")
+
+    def _save_config(self):
+        cfg = {
+            "fmc_url": self.fmc_url_var.get().strip(),
+            "username": self.user_var.get().strip(),
+            "password": self.pass_var.get() if self.save_pass_var.get() else "",
+            "verify_ssl": self.verify_var.get(),
+            "ca_cert": self.cert_var.get().strip(),
+        }
+        try:
+            save_config(cfg)
+        except OSError as err:
+            messagebox.showerror("Save failed", "Could not write {}:\n{}".format(CONFIG_PATH, err))
+            return
+        note = " (password included)" if cfg["password"] else " (password not saved)"
+        self._append_log("Saved settings to {}{}.\n".format(CONFIG_PATH, note), "ok")
+
+    # -- widget helpers ------------------------------------------------------
+
+    def _toggle_cert(self):
+        state = "normal" if self.verify_var.get() else "disabled"
+        self.cert_entry.configure(state=state)
+        self.cert_btn.configure(state=state)
+
+    def _browse_cert(self):
+        path = filedialog.askopenfilename(
+            title="Select CA certificate",
+            filetypes=[("Certificates", "*.pem *.crt *.cer"), ("All files", "*.*")],
+        )
+        if path:
+            self.cert_var.set(path)
+
+    def _browse_csv(self):
+        path = filedialog.askopenfilename(
+            title="Select CSV file",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if path:
+            self.csv_var.set(path)
+
+    # -- logging -------------------------------------------------------------
+
+    @staticmethod
+    def _classify(text):
+        low = text.lower()
+        if text.strip().startswith("==="):
+            return "banner"
+        if any(w in low for w in ("error", "failure", "failed", "exited", "stopped", "not found")):
+            return "err"
+        if any(w in low for w in ("approximated", "skipped", "retrying")):
+            return "warn"
+        if any(w in low for w in ("success", "done.", "finished", "saved")):
+            return "ok"
+        if any(w in low for w in ("sending", "creating", "updating", "retrieving", "looking up",
+                                  "fetching", "deleting")):
+            return "info"
+        return None
+
+    def _append_log(self, text, tag=None):
+        if tag is None:
+            tag = self._classify(text)
+        self.log.configure(state="normal")
+        if tag:
+            self.log.insert("end", text, tag)
+        else:
+            self.log.insert("end", text)
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _drain_log(self):
+        try:
+            while True:
+                self._append_log(self.log_queue.get_nowait())
+        except queue.Empty:
+            pass
+        self.after(100, self._drain_log)
+
+    # -- running -------------------------------------------------------------
+
+    def _start(self):
+        fmc_url = self.fmc_url_var.get().strip()
+        username = self.user_var.get().strip()
+        password = self.pass_var.get()
+        csv_path = self.csv_var.get().strip()
+        verify = self.verify_var.get()
+        cert = self.cert_var.get().strip()
+
+        if not (fmc_url and username and password and csv_path):
+            messagebox.showwarning("Missing input", "FMC URL, username, password and a CSV file are all required.")
+            return
+        if not fmc_url.startswith(("http://", "https://")):
+            messagebox.showwarning("Invalid URL", "FMC URL must start with https:// (or http://).")
+            return
+        if verify and not cert:
+            messagebox.showwarning("Missing certificate", "Select a CA certificate file or turn off SSL verification.")
+            return
+
+        self.run_btn.configure(state="disabled")
+        self._append_log("\n=== Starting import ===\n", "banner")
+        self.worker = threading.Thread(
+            target=self._work, args=(fmc_url, username, password, verify, cert, csv_path), daemon=True
+        )
+        self.worker.start()
+
+    def _work(self, fmc_url, username, password, verify, cert, csv_path):
+        # The communicator uses print() and calls exit() on failure, so capture
+        # stdout for the log box and catch SystemExit here in the worker thread.
+        old_stdout = sys.stdout
+        sys.stdout = QueueWriter(self.log_queue)
+        try:
+            run_import(fmc_url, username, password, verify, cert, csv_path)
+            self.log_queue.put("\n=== Finished ===\n")
+        except SystemExit:
+            self.log_queue.put("\n=== Stopped: the FMC communicator exited after an error (see log above) ===\n")
+        except Exception as err:
+            self.log_queue.put("\n=== Error: {} ===\n".format(err))
+        finally:
+            sys.stdout = old_stdout
+            self.after(0, lambda: self.run_btn.configure(state="normal"))
+
+
+if __name__ == "__main__":
+    App().mainloop()
