@@ -1,5 +1,6 @@
 import builtins
 import csv
+import ipaddress
 import json
 import os
 import queue
@@ -18,6 +19,8 @@ DEFAULT_DOMAIN_UUID = "e276abec-e0f2-11e3-8169-6d9ed49b625f"  # replaced by the 
 
 URL_OBJECT_PREFIX = "AGC-URL_"
 HOST_OBJECT_PREFIX = "AGC-HOST_"
+RANGE_OBJECT_PREFIX = "AGC-RANGE_"
+NETWORK_OBJECT_PREFIX = "AGC-NET_"
 NETWORK_GROUP_NAME = "AGC-Imported-Hosts"
 URL_GROUP_NAME = "AGC-Imported-URLs"
 
@@ -27,7 +30,8 @@ URL_GROUP_NAME = "AGC-Imported-URLs"
 if not hasattr(builtins, "exit"):
     builtins.exit = sys.exit
 
-
+# Config file lives next to the script, or next to the .exe when frozen.
+# (In a --onefile build __file__ points at a temp folder, so use sys.executable.)
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
 else:
@@ -106,6 +110,66 @@ def build_host_object_name(ip):
     return HOST_OBJECT_PREFIX + ip
 
 
+def build_range_object_name(range_value):
+    return RANGE_OBJECT_PREFIX + range_value
+
+
+def build_network_object_name(cidr_value):
+    # "/" is replaced so the name stays safe for FMC object names;
+    # the object's value keeps the real CIDR notation.
+    return NETWORK_OBJECT_PREFIX + cidr_value.replace("/", "_")
+
+
+def parse_cidr(value):
+    """Parse IPv4 CIDR notation. Returns (normalised_cidr, None) or (None, reason)."""
+    try:
+        return str(ipaddress.IPv4Network(value, strict=True)), None
+    except ValueError as err:
+        text = str(err)
+        if "host bits set" in text:
+            try:
+                suggestion = ipaddress.IPv4Network(value, strict=False)
+                return None, "host bits set (did you mean {}?)".format(suggestion)
+            except ValueError:
+                pass
+        return None, "not a valid IPv4 CIDR block"
+
+
+def classify_network_value(value):
+    """Decide whether a 'network' row is a CIDR block or a start-end range.
+    Returns (kind, normalised_value, reason): kind is 'cidr', 'range' or None."""
+    if "/" in value:
+        normalised, reason = parse_cidr(value)
+        return ("cidr", normalised, None) if normalised else (None, None, reason)
+    if "-" in value:
+        normalised, reason = parse_ip_range(value)
+        return ("range", normalised, None) if normalised else (None, None, reason)
+    return None, None, "expected a CIDR block (10.0.0.0/24) or a range (10.0.0.1-10.0.0.50)"
+
+
+def parse_ipv4(value):
+    """Return the normalised IPv4 string, or None if invalid."""
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ValueError:
+        return None
+
+
+def parse_ip_range(value):
+    """Parse 'start-end' (IPv4). Returns (normalised_value, None) or (None, reason)."""
+    parts = [p.strip() for p in value.split("-")]
+    if len(parts) != 2:
+        return None, "expected a range like 10.0.0.1-10.0.0.50"
+    try:
+        start = ipaddress.IPv4Address(parts[0])
+        end = ipaddress.IPv4Address(parts[1])
+    except ValueError:
+        return None, "start or end is not a valid IPv4 address"
+    if start > end:
+        return None, "range start is higher than range end"
+    return "{}-{}".format(start, end), None
+
+
 def to_url_value(fqdn):
     # Leading "*." becomes a leading "." (FMC suffix match). Other wildcards are
     # approximated and reported; fully-wildcard entries are unusable.
@@ -162,6 +226,49 @@ def get_or_create_host_object(fmc, host_endpoint, ip, cache):
     return created
 
 
+def get_or_create_range_object(fmc, range_endpoint, range_value, cache):
+    # Same pattern as hosts/URLs: the name is derived from the value, so a
+    # match by name already has the right value.
+    if range_value in cache:
+        return cache[range_value]
+
+    object_name = build_range_object_name(range_value)
+
+    existing = fmc.getObjectByName(range_endpoint, object_name)
+    if existing:
+        cache[range_value] = existing
+        return existing
+
+    created = fmc.createObject(range_endpoint, {
+        "name": object_name,
+        "value": range_value,
+        "type": "Range",
+    })
+    cache[range_value] = created
+    return created
+
+
+def get_or_create_network_object(fmc, network_endpoint, cidr_value, cache):
+    # CIDR blocks are FMC "Network" objects (/object/networks), distinct from "Range".
+    if cidr_value in cache:
+        return cache[cidr_value]
+
+    object_name = build_network_object_name(cidr_value)
+
+    existing = fmc.getObjectByName(network_endpoint, object_name)
+    if existing:
+        cache[cidr_value] = existing
+        return existing
+
+    created = fmc.createObject(network_endpoint, {
+        "name": object_name,
+        "value": cidr_value,
+        "type": "Network",
+    })
+    cache[cidr_value] = created
+    return created
+
+
 def upsert_object(fmc, endpoint, name, object_json):
     existing = fmc.getObjectByName(endpoint, name)
 
@@ -186,35 +293,71 @@ def run_import(fmc_ip, username, password, ssl_verify, ssl_cert, csv_path):
     domain_url = "{}/api/fmc_config/v1/domain/{}".format(base, fmc.domain_uuid)
 
     host_endpoint = domain_url + "/object/hosts"
+    range_endpoint = domain_url + "/object/ranges"
+    network_endpoint = domain_url + "/object/networks"
     network_group_endpoint = domain_url + "/object/networkgroups"
     url_endpoint = domain_url + "/object/urls"
     url_group_endpoint = domain_url + "/object/urlgroups"
 
-    host_cache, url_cache = {}, {}
+    host_cache, range_cache, cidr_cache, url_cache = {}, {}, {}, {}
     approximated, skipped = [], []
 
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        for line_no, row in enumerate(csv.DictReader(f), start=2):  # line 1 is the header
-            ip = (row.get("ipv4_address") or "").strip()
-            fqdn = (row.get("url") or "").strip()
+        reader = csv.DictReader(f)
+        headers = [(h or "").strip().lower() for h in (reader.fieldnames or [])]
+        if "object" not in headers or "type" not in headers:
+            raise ValueError("CSV header must be 'object,type' (found: {})".format(
+                ",".join(reader.fieldnames or []) or "nothing"))
 
-            if ip:
+        for line_no, raw_row in enumerate(reader, start=2):  # line 1 is the header
+            row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw_row.items()}
+            value = row.get("object", "")
+            obj_type = row.get("type", "").lower()
+
+            if not value and not obj_type:
+                continue  # blank line
+
+            if not value:
+                skipped.append((line_no, value, "empty object value"))
+                continue
+
+            if obj_type == "ipv4":
+                ip = parse_ipv4(value)
+                if ip is None:
+                    skipped.append((line_no, value, "not a valid IPv4 address"))
+                    continue
                 get_or_create_host_object(fmc, host_endpoint, ip, host_cache)
 
-            if fqdn:
-                url_value, note = to_url_value(fqdn)
+            elif obj_type == "network":
+                kind, net_value, reason = classify_network_value(value)
+                if kind is None:
+                    skipped.append((line_no, value, reason))
+                    continue
+                if kind == "cidr":
+                    get_or_create_network_object(fmc, network_endpoint, net_value, cidr_cache)
+                else:
+                    get_or_create_range_object(fmc, range_endpoint, net_value, range_cache)
+
+            elif obj_type == "url":
+                url_value, note = to_url_value(value)
                 if url_value is None:
-                    skipped.append((line_no, fqdn))
+                    skipped.append((line_no, value, "unusable after wildcard conversion"))
                     continue
                 if note == "approximated":
-                    approximated.append((line_no, fqdn, url_value))
+                    approximated.append((line_no, value, url_value))
                 get_or_create_url_object(fmc, url_endpoint, url_value, url_cache)
 
-    if host_cache:
+            else:
+                skipped.append((line_no, value, "unknown type '{}' (use url, ipv4 or network)".format(obj_type)))
+
+    # Network groups can hold Host, Range and Network objects.
+    network_members = (list(host_cache.values()) + list(range_cache.values())
+                       + list(cidr_cache.values()))
+    if network_members:
         upsert_object(fmc, network_group_endpoint, NETWORK_GROUP_NAME, {
             "name": NETWORK_GROUP_NAME,
             "type": "NetworkGroup",
-            "objects": [{"type": o["type"], "id": o["id"]} for o in host_cache.values()],
+            "objects": [{"type": o["type"], "id": o["id"]} for o in network_members],
         })
 
     if url_cache:
@@ -224,11 +367,12 @@ def run_import(fmc_ip, username, password, ssl_verify, ssl_cert, csv_path):
             "objects": [{"type": o["type"], "id": o["id"]} for o in url_cache.values()],
         })
 
-    print("\nDone. {} host objects and {} URL objects processed.".format(len(host_cache), len(url_cache)))
+    print("\nDone. {} host, {} range, {} network (CIDR) and {} URL objects processed.".format(
+        len(host_cache), len(range_cache), len(cidr_cache), len(url_cache)))
     for line_no, original, converted in approximated:
         print("  line {}: '{}' approximated as '{}'".format(line_no, original, converted))
-    for line_no, original in skipped:
-        print("  line {}: '{}' skipped (unusable after wildcard conversion)".format(line_no, original))
+    for line_no, original, reason in skipped:
+        print("  line {}: '{}' skipped ({})".format(line_no, original, reason))
 
 
 # ---------------------------------------------------------------------------
@@ -346,10 +490,8 @@ class App(tk.Tk):
         header.pack(fill="x")
         tk.Label(header, text="FMC CSV Importer", bg=C_HEADER, fg="#FFFFFF",
                  font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=16, pady=(12, 0))
-        tk.Label(header, text="Create host / URL objects and groups from a CSV", bg=C_HEADER,
-                 fg="#9CC4E4", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(0, 12))
-        tk.Label(header, text="Contact: minovskimarco@gmail.com", bg=C_HEADER,
-                 fg="#9CC4E4", font=("Segoe UI", 9)).pack(anchor="w", padx=8, pady=(0, 12))
+        tk.Label(header, text="Create host, range, network and URL objects and groups from a CSV", bg=C_HEADER,
+                 fg="#9CC4E4", font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(0, 12))
         tk.Frame(self, bg=C_ACCENT, height=3).pack(fill="x")
 
         body = ttk.Frame(self)
@@ -397,7 +539,7 @@ class App(tk.Tk):
         ).grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
 
         # CSV
-        csv_frame = ttk.LabelFrame(body, text=" Input CSV (columns: ipv4_address,url) ")
+        csv_frame = ttk.LabelFrame(body, text=" Input CSV (columns: object,type - type is url, ipv4 or network) ")
         csv_frame.pack(fill="x", pady=(0, 8))
         csv_frame.columnconfigure(0, weight=1)
         ttk.Entry(csv_frame, textvariable=self.csv_var).grid(row=0, column=0, sticky="ew", **pad)
