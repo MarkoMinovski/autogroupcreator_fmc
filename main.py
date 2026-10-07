@@ -17,12 +17,10 @@ from fmc_api_communicator import fmc_api_communicator
 DEFAULT_FMC_URL = "https://fmcrestapisandbox.cisco.com"
 DEFAULT_DOMAIN_UUID = "e276abec-e0f2-11e3-8169-6d9ed49b625f"  # replaced by the value FMC returns at login
 
-URL_OBJECT_PREFIX = "AGC-URL_"
-HOST_OBJECT_PREFIX = "AGC-HOST_"
-RANGE_OBJECT_PREFIX = "AGC-RANGE_"
-NETWORK_OBJECT_PREFIX = "AGC-NET_"
-NETWORK_GROUP_NAME = "AGC-Imported-Hosts"
-URL_GROUP_NAME = "AGC-Imported-URLs"
+# User-chosen name prefix; every object and group name is built from it, e.g.
+#   <prefix>-HOST_192.0.2.10   <prefix>-URL_example.com   <prefix>-Imported-URLs
+DEFAULT_NAME_PREFIX = "AGC"
+NAME_PREFIX_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
 
 # Frozen executables (PyInstaller etc.) don't ship the site module, so the
 # exit() builtin used by fmc_api_communicator doesn't exist there. Restore it
@@ -50,6 +48,7 @@ C_SECONDARY = "#E1E8F0"
 C_SECONDARY_HOVER = "#CFD9E4"
 C_TEXT = "#1E2A38"
 C_MUTED = "#5B6B7C"
+C_DANGER = "#C62828"    # warning text on light backgrounds
 C_LOG_BG = "#0F1B2A"
 C_LOG_TEXT = "#D6E2F0"
 C_LOG_INFO = "#6CB6F2"
@@ -63,7 +62,7 @@ C_LOG_ERR = "#F87171"
 # ---------------------------------------------------------------------------
 
 def load_config():
-    """Return dict with fmc_url, username, password, verify_ssl, ca_cert.
+    """Return dict with fmc_url, username, password, verify_ssl, ca_cert, name_prefix.
     Precedence: environment variables > config file > defaults."""
     cfg = {
         "fmc_url": DEFAULT_FMC_URL,
@@ -71,6 +70,7 @@ def load_config():
         "password": "",
         "verify_ssl": False,
         "ca_cert": "",
+        "name_prefix": DEFAULT_NAME_PREFIX,
     }
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -82,6 +82,9 @@ def load_config():
         pass
     except (OSError, ValueError) as err:
         print("Could not read {}: {}".format(CONFIG_PATH, err))
+
+    if not str(cfg["name_prefix"] or "").strip():
+        cfg["name_prefix"] = DEFAULT_NAME_PREFIX  # nothing (or blank) saved in config
 
     cfg["fmc_url"] = os.environ.get(ENV_URL, cfg["fmc_url"])
     cfg["username"] = os.environ.get(ENV_USER, cfg["username"])
@@ -102,22 +105,30 @@ def save_config(cfg):
 # Import logic
 # ---------------------------------------------------------------------------
 
-def build_url_object_name(url_value):
-    return URL_OBJECT_PREFIX + url_value
+def build_url_object_name(prefix, url_value):
+    return "{}-URL_{}".format(prefix, url_value)
 
 
-def build_host_object_name(ip):
-    return HOST_OBJECT_PREFIX + ip
+def build_host_object_name(prefix, ip):
+    return "{}-HOST_{}".format(prefix, ip)
 
 
-def build_range_object_name(range_value):
-    return RANGE_OBJECT_PREFIX + range_value
+def build_range_object_name(prefix, range_value):
+    return "{}-RANGE_{}".format(prefix, range_value)
 
 
-def build_network_object_name(cidr_value):
+def build_network_group_name(prefix):
+    return "{}-Imported-Hosts".format(prefix)
+
+
+def build_url_group_name(prefix):
+    return "{}-Imported-URLs".format(prefix)
+
+
+def build_network_object_name(prefix, cidr_value):
     # "/" is replaced so the name stays safe for FMC object names;
     # the object's value keeps the real CIDR notation.
-    return NETWORK_OBJECT_PREFIX + cidr_value.replace("/", "_")
+    return "{}-NET_{}".format(prefix, cidr_value.replace("/", "_"))
 
 
 def parse_cidr(value):
@@ -186,11 +197,11 @@ def to_url_value(fqdn):
     return fqdn, None
 
 
-def get_or_create_url_object(fmc, url_endpoint, url_value, cache):
+def get_or_create_url_object(fmc, url_endpoint, url_value, cache, prefix):
     if url_value in cache:
         return cache[url_value]
 
-    object_name = build_url_object_name(url_value)
+    object_name = build_url_object_name(prefix, url_value)
 
     existing = fmc.getObjectByName(url_endpoint, object_name)
     if existing:
@@ -206,11 +217,11 @@ def get_or_create_url_object(fmc, url_endpoint, url_value, cache):
     return created
 
 
-def get_or_create_host_object(fmc, host_endpoint, ip, cache):
+def get_or_create_host_object(fmc, host_endpoint, ip, cache, prefix):
     if ip in cache:
         return cache[ip]
 
-    object_name = build_host_object_name(ip)
+    object_name = build_host_object_name(prefix, ip)
 
     existing = fmc.getObjectByName(host_endpoint, object_name)
     if existing:
@@ -226,13 +237,13 @@ def get_or_create_host_object(fmc, host_endpoint, ip, cache):
     return created
 
 
-def get_or_create_range_object(fmc, range_endpoint, range_value, cache):
+def get_or_create_range_object(fmc, range_endpoint, range_value, cache, prefix):
     # Same pattern as hosts/URLs: the name is derived from the value, so a
     # match by name already has the right value.
     if range_value in cache:
         return cache[range_value]
 
-    object_name = build_range_object_name(range_value)
+    object_name = build_range_object_name(prefix, range_value)
 
     existing = fmc.getObjectByName(range_endpoint, object_name)
     if existing:
@@ -248,12 +259,12 @@ def get_or_create_range_object(fmc, range_endpoint, range_value, cache):
     return created
 
 
-def get_or_create_network_object(fmc, network_endpoint, cidr_value, cache):
+def get_or_create_network_object(fmc, network_endpoint, cidr_value, cache, prefix):
     # CIDR blocks are FMC "Network" objects (/object/networks), distinct from "Range".
     if cidr_value in cache:
         return cache[cidr_value]
 
-    object_name = build_network_object_name(cidr_value)
+    object_name = build_network_object_name(prefix, cidr_value)
 
     existing = fmc.getObjectByName(network_endpoint, object_name)
     if existing:
@@ -279,7 +290,7 @@ def upsert_object(fmc, endpoint, name, object_json):
     return fmc.createObject(endpoint, object_json)
 
 
-def run_import(fmc_ip, username, password, ssl_verify, ssl_cert, csv_path):
+def run_import(fmc_ip, username, password, ssl_verify, ssl_cert, csv_path, name_prefix=DEFAULT_NAME_PREFIX):
     fmc = fmc_api_communicator(
         domain_uuid=DEFAULT_DOMAIN_UUID,
         fmc_user=username,
@@ -326,7 +337,7 @@ def run_import(fmc_ip, username, password, ssl_verify, ssl_cert, csv_path):
                 if ip is None:
                     skipped.append((line_no, value, "not a valid IPv4 address"))
                     continue
-                get_or_create_host_object(fmc, host_endpoint, ip, host_cache)
+                get_or_create_host_object(fmc, host_endpoint, ip, host_cache, name_prefix)
 
             elif obj_type == "network":
                 kind, net_value, reason = classify_network_value(value)
@@ -334,9 +345,9 @@ def run_import(fmc_ip, username, password, ssl_verify, ssl_cert, csv_path):
                     skipped.append((line_no, value, reason))
                     continue
                 if kind == "cidr":
-                    get_or_create_network_object(fmc, network_endpoint, net_value, cidr_cache)
+                    get_or_create_network_object(fmc, network_endpoint, net_value, cidr_cache, name_prefix)
                 else:
-                    get_or_create_range_object(fmc, range_endpoint, net_value, range_cache)
+                    get_or_create_range_object(fmc, range_endpoint, net_value, range_cache, name_prefix)
 
             elif obj_type == "url":
                 url_value, note = to_url_value(value)
@@ -345,7 +356,7 @@ def run_import(fmc_ip, username, password, ssl_verify, ssl_cert, csv_path):
                     continue
                 if note == "approximated":
                     approximated.append((line_no, value, url_value))
-                get_or_create_url_object(fmc, url_endpoint, url_value, url_cache)
+                get_or_create_url_object(fmc, url_endpoint, url_value, url_cache, name_prefix)
 
             else:
                 skipped.append((line_no, value, "unknown type '{}' (use url, ipv4 or network)".format(obj_type)))
@@ -354,15 +365,17 @@ def run_import(fmc_ip, username, password, ssl_verify, ssl_cert, csv_path):
     network_members = (list(host_cache.values()) + list(range_cache.values())
                        + list(cidr_cache.values()))
     if network_members:
-        upsert_object(fmc, network_group_endpoint, NETWORK_GROUP_NAME, {
-            "name": NETWORK_GROUP_NAME,
+        group_name = build_network_group_name(name_prefix)
+        upsert_object(fmc, network_group_endpoint, group_name, {
+            "name": group_name,
             "type": "NetworkGroup",
             "objects": [{"type": o["type"], "id": o["id"]} for o in network_members],
         })
 
     if url_cache:
-        upsert_object(fmc, url_group_endpoint, URL_GROUP_NAME, {
-            "name": URL_GROUP_NAME,
+        group_name = build_url_group_name(name_prefix)
+        upsert_object(fmc, url_group_endpoint, group_name, {
+            "name": group_name,
             "type": "UrlGroup",
             "objects": [{"type": o["type"], "id": o["id"]} for o in url_cache.values()],
         })
@@ -424,7 +437,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("FMC CSV Importer")
-        self.geometry("760x640")
+        self.geometry("1024x768")
         self.minsize(640, 540)
         self.configure(bg=C_BG)
 
@@ -438,6 +451,8 @@ class App(tk.Tk):
         self.verify_var = tk.BooleanVar(value=bool(cfg["verify_ssl"]))
         self.cert_var = tk.StringVar(value=cfg["ca_cert"])
         self.save_pass_var = tk.BooleanVar(value=False)
+        self.prefix_var = tk.StringVar(value=cfg["name_prefix"])
+        self.save_prefix_var = tk.BooleanVar(value=False)
         self.csv_var = tk.StringVar()
 
         self._setup_style()
@@ -455,6 +470,7 @@ class App(tk.Tk):
         style.configure("TFrame", background=C_BG)
         style.configure("TLabel", background=C_PANEL, foreground=C_TEXT)
         style.configure("Muted.TLabel", background=C_PANEL, foreground=C_MUTED, font=("Segoe UI", 9))
+        style.configure("Warning.TLabel", background=C_PANEL, foreground=C_DANGER, font=("Segoe UI", 9, "bold"))
 
         style.configure("TLabelframe", background=C_PANEL, bordercolor=C_SECONDARY, relief="solid")
         style.configure("TLabelframe.Label", background=C_PANEL, foreground=C_HEADER,
@@ -490,8 +506,10 @@ class App(tk.Tk):
         header.pack(fill="x")
         tk.Label(header, text="FMC CSV Importer", bg=C_HEADER, fg="#FFFFFF",
                  font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=16, pady=(12, 0))
-        tk.Label(header, text="Create host, range, network and URL objects and groups from a CSV", bg=C_HEADER,
+        tk.Label(header, text="Create host, range, network and URL objects and groups from a CSV file", bg=C_HEADER,
                  fg="#9CC4E4", font=("Segoe UI", 9)).pack(anchor="w", padx=16, pady=(0, 12))
+        tk.Label(header, text="Contact: minovskimarco@gmail.com", bg=C_HEADER,
+                 fg="#9CC4E4", font=("Segoe UI", 8)).pack(anchor="w", padx=16, pady=(0, 6))
         tk.Frame(self, bg=C_ACCENT, height=3).pack(fill="x")
 
         body = ttk.Frame(self)
@@ -538,6 +556,26 @@ class App(tk.Tk):
             CONFIG_PATH.name, ENV_URL, ENV_USER, ENV_PASS), style="Muted.TLabel"
         ).grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
 
+        # Naming
+        naming = ttk.LabelFrame(body, text=" Object naming ")
+        naming.pack(fill="x", pady=(0, 8))
+        naming.columnconfigure(1, weight=1)
+        ttk.Label(naming, text="Name prefix:").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(naming, textvariable=self.prefix_var).grid(row=0, column=1, sticky="ew", **pad)
+        ttk.Checkbutton(naming, text="Include in config when saving",
+                        variable=self.save_prefix_var).grid(row=0, column=2, sticky="w", **pad)
+        self.prefix_preview = ttk.Label(naming, text="", style="Muted.TLabel")
+        self.prefix_preview.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+        ttk.Label(
+            naming,
+            text=("Warning: running the same input file with a different prefix creates a new set of "
+                  "objects, because existing objects are looked up by name. This can result in "
+                  "duplicate objects in FMC."),
+            style="Warning.TLabel", wraplength=660, justify="left",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+        self.prefix_var.trace_add("write", lambda *_: self._update_prefix_preview())
+        self._update_prefix_preview()
+
         # CSV
         csv_frame = ttk.LabelFrame(body, text=" Input CSV (columns: object,type - type is url, ipv4 or network) ")
         csv_frame.pack(fill="x", pady=(0, 8))
@@ -575,6 +613,7 @@ class App(tk.Tk):
         self.pass_var.set(cfg["password"])
         self.verify_var.set(bool(cfg["verify_ssl"]))
         self.cert_var.set(cfg["ca_cert"])
+        self.prefix_var.set(cfg["name_prefix"])
         self._toggle_cert()
         self._append_log("Config reloaded from {} (and environment).\n".format(CONFIG_PATH.name), "info")
 
@@ -586,15 +625,25 @@ class App(tk.Tk):
             "verify_ssl": self.verify_var.get(),
             "ca_cert": self.cert_var.get().strip(),
         }
+        # Opt-in, like the password: only written when the tick box is set.
+        if self.save_prefix_var.get():
+            cfg["name_prefix"] = self.prefix_var.get().strip()
         try:
             save_config(cfg)
         except OSError as err:
             messagebox.showerror("Save failed", "Could not write {}:\n{}".format(CONFIG_PATH, err))
             return
-        note = " (password included)" if cfg["password"] else " (password not saved)"
+        note = " (password {}, prefix {})".format(
+            "included" if cfg["password"] else "not saved",
+            "included" if "name_prefix" in cfg else "not saved")
         self._append_log("Saved settings to {}{}.\n".format(CONFIG_PATH, note), "ok")
 
     # -- widget helpers ------------------------------------------------------
+
+    def _update_prefix_preview(self):
+        prefix = self.prefix_var.get().strip() or "<prefix>"
+        self.prefix_preview.configure(
+            text="e.g. {p}-HOST_192.0.2.10   {p}-URL_example.com   groups: {p}-Imported-Hosts, {p}-Imported-URLs".format(p=prefix))
 
     def _toggle_cert(self):
         state = "normal" if self.verify_var.get() else "disabled"
@@ -663,6 +712,7 @@ class App(tk.Tk):
         csv_path = self.csv_var.get().strip()
         verify = self.verify_var.get()
         cert = self.cert_var.get().strip()
+        prefix = self.prefix_var.get().strip()
 
         if not (fmc_url and username and password and csv_path):
             messagebox.showwarning("Missing input", "FMC URL, username, password and a CSV file are all required.")
@@ -674,20 +724,27 @@ class App(tk.Tk):
             messagebox.showwarning("Missing certificate", "Select a CA certificate file or turn off SSL verification.")
             return
 
+        if not NAME_PREFIX_PATTERN.fullmatch(prefix):
+            messagebox.showwarning(
+                "Invalid name prefix",
+                "The name prefix must be 1-40 characters, start with a letter or digit, and contain only "
+                "letters, digits, '.', '_' or '-'.")
+            return
+
         self.run_btn.configure(state="disabled")
         self._append_log("\n=== Starting import ===\n", "banner")
         self.worker = threading.Thread(
-            target=self._work, args=(fmc_url, username, password, verify, cert, csv_path), daemon=True
+            target=self._work, args=(fmc_url, username, password, verify, cert, csv_path, prefix), daemon=True
         )
         self.worker.start()
 
-    def _work(self, fmc_url, username, password, verify, cert, csv_path):
+    def _work(self, fmc_url, username, password, verify, cert, csv_path, prefix):
         # The communicator uses print() and calls exit() on failure, so capture
         # stdout for the log box and catch SystemExit here in the worker thread.
         old_stdout = sys.stdout
         sys.stdout = QueueWriter(self.log_queue)
         try:
-            run_import(fmc_url, username, password, verify, cert, csv_path)
+            run_import(fmc_url, username, password, verify, cert, csv_path, prefix)
             self.log_queue.put("\n=== Finished ===\n")
         except SystemExit:
             self.log_queue.put("\n=== Stopped: the FMC communicator exited after an error (see log above) ===\n")

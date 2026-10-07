@@ -129,7 +129,7 @@ class fmc_api_communicator:
                 time.sleep(delay)
 
         # All 5 attempts failed
-        print('FMC request failed after 5 attempts.')
+        print('FMC request failed after 5 attempts. Resuming')
         exit()
 
     def createObject(self, object_endpoint, object_json):
